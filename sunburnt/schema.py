@@ -49,7 +49,7 @@ class solr_date(object):
         if hasattr(dt_obj, 'tzinfo') and dt_obj.tzinfo:
             # but Solr requires UTC times.
             if pytz:
-                return dt_obj.astimezone(pytz.utc)
+                return dt_obj.astimezone(pytz.utc).replace(tzinfo=None)
             else:
                 raise EnvironmentError("pytz not available, cannot do timezone conversions")
         else:
@@ -69,8 +69,13 @@ class solr_date(object):
         """ Serialize a datetime object in the format required
         by Solr. See http://wiki.apache.org/solr/IndexingDates
         """
-        return u"%s.%sZ" % (self._dt_obj.strftime("%Y-%m-%dT%H:%M:%S"),
-                            "%06d" % self.microsecond)
+        if hasattr(self._dt_obj, 'isoformat'):
+            return "%sZ" % (self._dt_obj.isoformat(), )
+        strtime = self._dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
+        microsecond = self.microsecond
+        if microsecond:
+            return u"%s.%06dZ" % (strtime, microsecond)
+        return u"%sZ" % (strtime,)
 
     def __cmp__(self, other):
         try:
@@ -141,6 +146,14 @@ class SolrField(object):
                 return name.endswith(self.name[1:])
             else:
                 return name.startswith(self.name[:-1])
+
+    def normalize(self, value):
+        """ Normalize the given value according to the field type.
+        
+        This method does nothing by default, returning the given value
+        as is. Child classes may override this method as required.
+        """
+        return value
 
     def instance_from_user_data(self, data):
         return SolrFieldInstance.from_user_data(self, data)
@@ -387,6 +400,7 @@ class SolrSchema(object):
         'solr.LatLonType':SolrPoint2Field,
         'solr.GeoHashField':SolrPoint2Field,
     }
+
     def __init__(self, f):
         """initialize a schema object from a
         filename or file-like object."""
@@ -436,10 +450,8 @@ class SolrSchema(object):
             name, class_name = field_type_node.attrib['name'], field_type_node.attrib['class']
         except KeyError, e:
             raise SolrError("Invalid schema.xml: missing %s attribute on fieldType" % e.args[0])
-        try:
-            field_class = self.solr_data_types[class_name]
-        except KeyError:
-            raise SolrError("Unknown field_class '%s'" % class_name)
+        #Obtain field type for given class. Defaults to generic SolrField.
+        field_class = self.solr_data_types.get(class_name, SolrField)
         return name, SolrFieldTypeFactory(field_class,
             **self.translate_attributes(field_type_node.attrib))
 
@@ -507,7 +519,7 @@ class SolrSchema(object):
         return SolrDelete(self, docs, query)
 
     def parse_response(self, msg):
-        return SolrResponse(self, msg)
+        return SolrResponse.from_xml(self, msg)
 
     def parse_result_doc(self, doc, name=None):
         if name is None:
@@ -637,7 +649,9 @@ class SolrFacetCounts(object):
 
 
 class SolrResponse(object):
-    def __init__(self, schema, xmlmsg):
+    @classmethod
+    def from_xml(cls, schema, xmlmsg):
+        self = cls()
         self.schema = schema
         self.original_xml = xmlmsg
         doc = lxml.etree.fromstring(xmlmsg)
@@ -649,13 +663,13 @@ class SolrResponse(object):
         if self.status != 0:
             raise ValueError("Response indicates an error")
         result_node = doc.xpath("/response/result")[0]
-        self.result = SolrResult(schema, result_node)
+        self.result = SolrResult.from_xml(schema, result_node)
         self.facet_counts = SolrFacetCounts.from_response(details)
         self.highlighting = dict((k, dict(v))
                                  for k, v in details.get("highlighting", ()))
         more_like_these_nodes = \
             doc.xpath("/response/lst[@name='moreLikeThis']/result")
-        more_like_these_results = [SolrResult(schema, node)
+        more_like_these_results = [SolrResult.from_xml(schema, node)
                                   for node in more_like_these_nodes]
         self.more_like_these = dict((n.name, n)
                                          for n in more_like_these_results)
@@ -671,6 +685,7 @@ class SolrResponse(object):
         else:
             value = None
         self.interesting_terms = value
+        return self
 
     def __str__(self):
         return str(self.result)
@@ -683,12 +698,15 @@ class SolrResponse(object):
 
 
 class SolrResult(object):
-    def __init__(self, schema, node):
+    @classmethod
+    def from_xml(cls, schema, node):
+        self = cls()
         self.schema = schema
         self.name = node.attrib['name']
         self.numFound = int(node.attrib['numFound'])
         self.start = int(node.attrib['start'])
         self.docs = [schema.parse_result_doc(n) for n in node.xpath("doc")]
+        return self
 
     def __str__(self):
         return "%(numFound)s results found, starting at #%(start)s\n\n" % self.__dict__ + str(self.docs)
